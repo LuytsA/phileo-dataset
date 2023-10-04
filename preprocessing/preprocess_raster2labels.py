@@ -33,7 +33,7 @@ def create_label_terrain(tile_path:str,
 
     try:
         if os.path.exists(reference_raster):
-            output_path = f'{folder_dst}/{tile}_label_kg.tif'
+            output_path = f'{folder_dst}/{tile}_label_terrain.tif'
             
             if not os.path.exists(output_path) or overwrite:
                 terrain_clipped = raster_clip_to_reference(dem_map, reference_raster=reference_raster)
