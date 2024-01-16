@@ -1,5 +1,9 @@
 import os
-import sys; sys.path.append("./")
+import sys;
+
+import buteo
+
+sys.path.append("./")
 import numpy as np
 from glob import glob
 from tqdm import tqdm
@@ -12,7 +16,7 @@ from functools import partial
 import concurrent.futures
 import gc
 
-LABELS = ['label_roads','label_kg','label_building','label_lc', 'label_coords', 'label_time']
+LABELS = ['label_lc', 'label_roads', 'label_kg', 'label_building'] # ['label_roads','label_kg','label_building','label_lc', 'label_coords', 'label_time']
 DATASETS = ['mini_foundation', 'downstream']
 
 
@@ -143,7 +147,7 @@ def select_and_save_patches(
     # save s2 patches
     if partition=='train':
         selected_s2_val = np.concatenate(selected_s2_val)
-    
+
         np.save(f'{dst_folder}/{tile}_train_s2.npy', selected_s2)
         np.save(f'{dst_folder}/{tile}_val_s2.npy', selected_s2_val)
 
@@ -218,7 +222,8 @@ def process_tile(
         patch_size: int = 128,
         val_split_ratio: float = 0.1,
         partition: str = 'train',
-        dataset: str = 'downstream'
+        dataset: str = 'downstream',
+        r10_to_r30: bool = False
 ):
 
     '''
@@ -273,11 +278,19 @@ def process_tile(
         assert bo.check_rasters_are_aligned(timeseries_s2_raster+list(labels_raster.values())), 'labels and images are not aligned'
 
         labels_arr = {label:bo.raster_to_array(label_path) for label, label_path in labels_raster.items()}
-        labels_patches = {label:bo.array_to_patches(arr, tile_size=patch_size, n_offsets=overlaps) for label, arr in labels_arr.items()}
 
+        if r10_to_r30:
+            # resample to 30m resolution for pritvi
+            labels_arr = {label: bo.resample_array(arr, target_shape_pixels=(arr.shape[0] / 3, arr.shape[1] / 3, arr.shape[2]), resample_alg='nearest')
+                                    for label, arr in labels_arr.items()}
+        labels_patches = {label:bo.array_to_patches(arr, tile_size=patch_size, n_offsets=overlaps) for label, arr in labels_arr.items()}
 
         # turn each image of timeseries to patches
         timeseries_s2_arr= [bo.raster_to_array(s2_t) for s2_t in timeseries_s2_raster]
+        if r10_to_r30:
+            # resample to 30m resolution for pritvi
+            timeseries_s2_arr = [bo.resample_array(arr, target_shape_pixels=(arr.shape[0] / 3, arr.shape[1] / 3, arr.shape[2]))
+                                 for arr in timeseries_s2_arr]
         timeseries_s2_patches= [bo.array_to_patches(arr,tile_size=patch_size, n_offsets=overlaps) for arr in timeseries_s2_arr]
 
         select_and_save_patches(tile=tile, label_patches_dict=labels_patches, s2_patches=timeseries_s2_patches, dst_folder=folder_dst,
@@ -301,7 +314,8 @@ def preprocess_tifs(
         create_geo_label: bool = False,
         test_locations: list = None,
         train_locations: list = None,
-        num_workers: int = None
+        num_workers: int = None,
+        r10_to_r30: bool = False
 ):
     
     '''
@@ -358,14 +372,13 @@ def preprocess_tifs(
         if x in test_locations:
             raise ValueError("Location in both train and test.")
 
-
     print('processing train locations ...')
-    proc = partial(process_tile, folder_dst = folder_dst, folder_src = folder_src, dataset=dataset, overlaps=overlaps, patch_size=patch_size, val_split_ratio=val_split_ratio, partition='train')
+    proc = partial(process_tile, folder_dst = folder_dst, folder_src = folder_src, dataset=dataset, overlaps=overlaps, patch_size=patch_size, val_split_ratio=val_split_ratio, partition='train', r10_to_r30=r10_to_r30)
     with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
         list(tqdm(executor.map(proc, train_locations), total=len(train_locations)))
 
     print('processing test locations ...')
-    proc = partial(process_tile, folder_dst = folder_dst, folder_src = folder_src, dataset=dataset, overlaps=overlaps, patch_size=patch_size, val_split_ratio=val_split_ratio, partition='test')
+    proc = partial(process_tile, folder_dst = folder_dst, folder_src = folder_src, dataset=dataset, overlaps=overlaps, patch_size=patch_size, val_split_ratio=val_split_ratio, partition='test', r10_to_r30=r10_to_r30)
     with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
         list(tqdm(executor.map(proc, test_locations), total=len(test_locations)))
 
@@ -377,12 +390,13 @@ def preprocess_tifs(
         paths_label_coordinates = glob.glob(f"{folder_dst}/*_label_coords.npy")
         paths_label_kg = glob.glob(f"{folder_dst}/*_label_kg.npy")
         paths_label_time = glob.glob(f"{folder_dst}/*_label_time.npy")
+        paths_label_terrain = glob.glob(f"{folder_dst}/*_label_terrain_classes.npy")
         assert len(paths_label_coordinates)==len(paths_label_kg), 'number of coordinate labels and kg labels do not match'
         assert len(paths_label_coordinates)==len(paths_label_time), 'number of coordinate labels and time labels do not match'
 
         proc = partial(merge_labels_to_geolabel, dst_folder = folder_dst, n_kg_classes=n_kg_classes)
         with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
-            list(tqdm(executor.map(proc, zip(sorted(paths_label_kg),sorted(paths_label_coordinates),sorted(paths_label_time))), total=len(paths_label_coordinates)))
+            list(tqdm(executor.map(proc, zip(sorted(paths_label_kg),sorted(paths_label_coordinates),sorted(paths_label_time), sorted(paths_label_terrain))), total=len(paths_label_coordinates)))
 
 
 
@@ -412,28 +426,29 @@ def preprocess_tifs(
 
 
 def main():
-    src_folder = '/phileo_data/downstream/downstream_dataset_tifs' 
-    dst_folder = 'testing' # /phileo_data/downstream/downstream_dataset_patches_np
+    src_folder = '/phileo_data/downstream/downstream_dataset_tifs/'
+    dst_folder = '/phileo_data/downstream/downstream_dataset_patches_np_224'
         
     N_OFFSETS = 0
-    PATCH_SIZE = 128
-    VAL_SPLIT_RATIO = 0
+    PATCH_SIZE = 224
+    VAL_SPLIT_RATIO = 0.1
     DATASET = 'downstream'
     
-    with open(f'utils/train_test_location_downstream.json', 'r') as f:
+    with open(f'/home/lcamilleri/git_repos/phileo-dataset/utils/train_test_location_downstream.json', 'r') as f:
         train_test_locations = json.load(f)
 
 
-    train_locations =  train_test_locations['train_locations'] 
+    train_locations =  train_test_locations['train_locations']
     test_locations = train_test_locations['test_locations']
 
-    # if DATASET == 'mini_foundation':
-    #     folder = '10_points_filtered_22_07'
-    #     src_folder = f'/phileo_data/mini_foundation/mini_foundation_tifs/{folder}'
-    #     files = glob.glob(f"/phileo_data/mini_foundation/mini_foundation_SAFE/{folder}/**.SAFE")
-    #     train_locations = [f.split('/')[-1].split('.SAFE')[0] for f in files]
-    #     test_locations = []
-
+    # for folder in ['10_points_filtered_22_07', '10_points_filtered_22_01', '10_points_filtered_22_04', '10_points_filtered_22_10']:
+    #     if DATASET == 'mini_foundation':
+    #         # folder = '10_points_filtered_22_07'
+    #         src_folder = f'/phileo_data/mini_foundation/mini_foundation_tifs/{folder}'
+    #         dst_folder = f'/phileo_data/mini_foundation/mini_foundation_patches_np/patches_labeled/{folder}/'
+    #         files = glob.glob(f"/phileo_data/mini_foundation/mini_foundation_SAFE/{folder}/**.SAFE")
+    #         train_locations = [f.split('/')[-1].split('.SAFE')[0] for f in files]
+    #         test_locations = []
 
     preprocess_tifs(
         folder_src=src_folder,
@@ -445,11 +460,10 @@ def main():
         test_locations=test_locations,
         train_locations=train_locations,
         create_geo_label=False,
-        num_workers=2
-)
+        num_workers=4
+    )
         
 
 if __name__ == '__main__':
     main()
-
 
